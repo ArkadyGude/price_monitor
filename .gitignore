@@ -1,0 +1,6 @@
+__pycache__/
+Clients/
+venv/
+*.log
+check_prices_opt.py
+check_prices.py
