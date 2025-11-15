@@ -401,6 +401,103 @@ def find_price_changes(
     return changes
 
 
+async def _get_client_data(
+    folder: Path, client_name: str
+) -> Optional[Tuple[List[Dict[str, Any]], str]]:
+    """Получить данные клиента (файлы и API ключ)"""
+    references_prices_path = folder / PATH_PRICES
+
+    if not references_prices_path.exists():
+        logging.warning("Папка с ценами не найдена для клиента %s", client_name)
+        return None
+
+    files = get_reference_prices_files(str(references_prices_path))
+    if not files:
+        logging.warning("Файлы с ценами не найдены для клиента %s", client_name)
+        return None
+
+    items_data = read_prices_data(files)
+    if not items_data:
+        logging.warning(
+            "Не удалось прочитать данные о ценах для клиента %s", client_name
+        )
+        return None
+
+    api_key = get_api_key(str(folder))
+    return items_data, api_key
+
+
+async def _fetch_current_prices(
+    client_name: str,
+    session: RobustClientSession,
+    rate_manager: RateLimitManager,
+    headers: Dict[str, str],
+) -> Optional[dict]:
+    """Получить текущие цены через API"""
+    await rate_manager.acquire(client_name)
+
+    params = {"limit": LIMIT}
+    response_data = await session.request_with_retry(
+        "GET", GET_PRICES, headers=headers, params=params
+    )
+
+    if not response_data:
+        logging.error("%s - Не удалось получить данные API", client_name)
+
+    return response_data
+
+
+async def _send_price_changes(
+    client_name: str,
+    session: RobustClientSession,
+    rate_manager: RateLimitManager,
+    headers: Dict[str, str],
+    items_data: List[Dict[str, Any]],
+) -> bool:
+    """Отправить изменения цен"""
+    await rate_manager.acquire(client_name)
+
+    change_data = {"data": items_data}
+    change_response = await session.request_with_retry(
+        "POST", CHANGE_PRICES, headers=headers, json=change_data
+    )
+
+    if change_response:
+        logging.info("%s - Цены успешно отправлены", client_name)
+        return True
+    else:
+        logging.error("%s - Не удалось отправить цены", client_name)
+        return False
+
+
+async def _send_telegram_notification(
+    client_name: str,
+    message_type: str,  # "changed" или "restored"
+    changes_count: int,
+    telegram_handler: Optional[AsyncTelegramHandler],
+    session: RobustClientSession,
+) -> None:
+    """Отправить уведомление в Telegram (только через явный вызов)"""
+    if telegram_handler and hasattr(telegram_handler, "async_emit"):
+        if message_type == "changed":
+            msg_text = f"🔄 {client_name} - Цены изменились (попали в акцию)"
+        else:  # restored
+            msg_text = f"✅ {client_name} - Цены восстановлены в исходное состояние"
+
+        await telegram_handler.async_emit(
+            logging.LogRecord(
+                name="price_monitor",
+                level=logging.WARNING,
+                pathname=__file__,
+                lineno=0,
+                msg="%s\nИзменений: %s шт.",
+                args=(msg_text, changes_count),
+                exc_info=None,
+            ),
+            session,
+        )
+
+
 async def process_client(
     folder: Path,
     session: RobustClientSession,
@@ -409,41 +506,21 @@ async def process_client(
 ) -> None:
     """Обработать данные для одного клиента"""
     client_name = folder.name
-    references_prices_path = folder / PATH_PRICES
-
-    if not references_prices_path.exists():
-        logging.warning("Папка с ценами не найдена для клиента %s", client_name)
-        return
 
     try:
-        # Получение данных
-        files = get_reference_prices_files(str(references_prices_path))
-        if not files:
-            logging.warning("Файлы с ценами не найдены для клиента %s", client_name)
+        # Получение данных клиента
+        client_data = await _get_client_data(folder, client_name)
+        if not client_data:
             return
 
-        items_data = read_prices_data(files)
-        if not items_data:
-            logging.warning(
-                "Не удалось прочитать данные о ценах для клиента %s", client_name
-            )
-            return
-
-        # Получение API ключа
-        api_key = get_api_key(str(folder))
+        items_data, api_key = client_data
         headers = get_headers(api_key)
 
-        # Ждем лимит
-        await rate_manager.acquire(client_name)
-
-        # Запрос текущих цен
-        params = {"limit": LIMIT}
-        response_data = await session.request_with_retry(
-            "GET", GET_PRICES, headers=headers, params=params
+        # Получение текущих цен
+        response_data = await _fetch_current_prices(
+            client_name, session, rate_manager, headers
         )
-
         if not response_data:
-            logging.error("%s - Не удалось получить данные API", client_name)
             return
 
         logging.info("%s - Данные получены успешно", client_name)
@@ -455,39 +532,35 @@ async def process_client(
             logging.info("%s - Все цены актуальны", client_name)
             return
 
-        # Обработка изменений
-        logging.warning(
-            "%s - Товары попали в акцию. Изменений: %s шт.", client_name, len(changes)
+        # Первое уведомление: товары попали в акцию
+        logging.info(
+            "%s - Обнаружены изменения цен: %s шт.", client_name, len(changes)
+        )  # Изменено на INFO чтобы не дублировалось в Telegram
+
+        # Первое сообщение в Telegram
+        await _send_telegram_notification(
+            client_name, "changed", len(changes), telegram_handler, session
         )
-
-        # Уведомление в Telegram
-        if telegram_handler and hasattr(telegram_handler, "async_emit"):
-            await telegram_handler.async_emit(
-                logging.LogRecord(
-                    name="price_monitor",
-                    level=logging.WARNING,
-                    pathname=__file__,
-                    lineno=0,
-                    msg="%s - Товары в акции. Изменений: %s",
-                    args=(client_name, len(changes)),
-                    exc_info=None,
-                ),
-                session,
-            )
-
-        # Ждем лимит для отправки изменений
-        await rate_manager.acquire(client_name)
 
         # Отправка исправленных цен
-        change_data = {"data": items_data}
-        change_response = await session.request_with_retry(
-            "POST", CHANGE_PRICES, headers=headers, json=change_data
+        success = await _send_price_changes(
+            client_name, session, rate_manager, headers, items_data
         )
 
-        if change_response:
-            logging.info("%s - Цены успешно отправлены", client_name)
+        # Второе уведомление: цены успешно восстановлены
+        if success:
+            logging.info(
+                "%s - Цены успешно восстановлены: %s шт.", client_name, len(changes)
+            )  # Изменено на INFO
+
+            # Второе сообщение в Telegram
+            await _send_telegram_notification(
+                client_name, "restored", len(changes), telegram_handler, session
+            )
         else:
-            logging.error("%s - Не удалось отправить цены", client_name)
+            logging.error(
+                "%s - Не удалось восстановить цены. Ошибка при отправке", client_name
+            )
 
     except Exception as e:
         logging.error("%s - Неожиданная ошибка: %s", client_name, e)

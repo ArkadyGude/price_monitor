@@ -5,3 +5,6 @@ venv/
 check_prices_opt.py
 check_prices.py
 main_cync.py
+.env
+chat_id.py
+message_to_bot.py
